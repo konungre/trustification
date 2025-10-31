@@ -1,8 +1,14 @@
+use anyhow::Result;
+use cyclonedx_bom::models::component::Classification;
 use patternfly_yew::prelude::*;
 use serde_json::json;
+use spdx_rs::models::{PrimaryPackagePurpose, SPDX};
 use spog_ui_backend::{use_backend, ApplyAccessToken};
 use spog_ui_utils::analytics::use_wrap_tracking;
-use std::rc::Rc;
+use std::{
+    rc::Rc,
+    str::FromStr,
+};
 use url::Url;
 use wasm_bindgen::{JsCast, JsValue};
 use yew::prelude::*;
@@ -29,6 +35,9 @@ pub struct SbomKebabDropdownProperties {
 
     #[prop_or_default]
     pub dropdown_variant: MenuToggleVariant,
+
+    #[prop_or_default]
+    pub spdx: Option<Rc<SPDX>>,
 }
 
 #[function_component(SbomKebabDropdown)]
@@ -52,6 +61,27 @@ pub fn sbom_kebab_dropdown(props: &SbomKebabDropdownProperties) -> Html {
             }
         }
     });
+
+    let on_generate_cyclonedx_click = use_callback(
+        (
+            props.spdx.clone(),
+            local_file.clone(),
+            props.id.clone(),
+        ),
+        move |_, (spdx, local_file, id)| {
+            if let Some(spdx) = spdx.clone() {
+                match generate_cyclonedx(spdx.as_ref()) {
+                    Ok(data) => {
+                        let filename = format!("{}-cyclonedx.json", safe_filename(&id));
+                        local_file.set(Some((Rc::new(data), filename)));
+                    }
+                    Err(err) => {
+                        log::error!("Failed to generate CycloneDX SBOM: {err}");
+                    }
+                }
+            }
+        },
+    );
 
     let on_download_licenses_click = use_callback(
         (props.id.clone(), access_token.clone()),
@@ -99,6 +129,9 @@ pub fn sbom_kebab_dropdown(props: &SbomKebabDropdownProperties) -> Html {
                 icon={props.dropdown_icon.clone()}
         >
             <MenuAction onclick={on_download_sbom_click}>{"Download SBOM"}</MenuAction>
+            { for props.spdx.is_some().then(|| html_nested!(
+                <MenuAction onclick={on_generate_cyclonedx_click}>{"Generate CycloneDX"}</MenuAction>
+            )) }
             <MenuAction onclick={on_download_licenses_click}>{"Download License Report"}</MenuAction>
         </Dropdown>
     )
@@ -135,6 +168,106 @@ pub fn download(props: &DownloadProperties) -> Html {
             {onclick}
         />
     )
+}
+
+fn generate_cyclonedx(spdx: &SPDX) -> Result<String> {
+    use cyclonedx_bom::external_models::{
+        normalized_string::NormalizedString,
+        uri::Purl,
+    };
+    use cyclonedx_bom::models::{
+        bom::{Bom, SpecVersion},
+        component::{Component, Components},
+    };
+
+    let mut bom = Bom::default();
+    bom.spec_version = SpecVersion::V1_4;
+
+    let mut components = Vec::new();
+
+    for package in &spdx.package_information {
+        let classification = package
+            .primary_package_purpose
+            .as_ref()
+            .map(spdx_purpose_to_classification)
+            .unwrap_or(Classification::Library);
+
+        let default_version = package.package_version.as_deref().unwrap_or("");
+        let mut component = Component::new(
+            classification,
+            &package.package_name,
+            default_version,
+            Some(package.package_spdx_identifier.clone()),
+        );
+
+        if package.package_version.is_none() {
+            component.version = None;
+        }
+
+        if let Some(description) = package
+            .package_summary_description
+            .as_ref()
+            .or(package.package_detailed_description.as_ref())
+        {
+            component.description = Some(NormalizedString::new(description));
+        }
+
+        if let Some(purl_ref) = package
+            .external_reference
+            .iter()
+            .find(|reference| reference.reference_type.eq_ignore_ascii_case("purl"))
+        {
+            if let Ok(purl) = Purl::from_str(&purl_ref.reference_locator) {
+                component.purl = Some(purl);
+            }
+        }
+
+        components.push(component);
+    }
+
+    if components.is_empty() {
+        anyhow::bail!("No packages found in SPDX document");
+    }
+
+    bom.components = Some(Components(components));
+
+    let mut output = Vec::new();
+    bom.output_as_json(&mut output, SpecVersion::V1_4)?;
+
+    Ok(String::from_utf8(output)?)
+}
+
+fn spdx_purpose_to_classification(purpose: &PrimaryPackagePurpose) -> Classification {
+    match purpose {
+        PrimaryPackagePurpose::Application => Classification::Application,
+        PrimaryPackagePurpose::Framework => Classification::Framework,
+        PrimaryPackagePurpose::Library => Classification::Library,
+        PrimaryPackagePurpose::Container => Classification::Container,
+        PrimaryPackagePurpose::OperatingSystem => Classification::OperatingSystem,
+        PrimaryPackagePurpose::Device => Classification::Device,
+        PrimaryPackagePurpose::Firmware => Classification::Firmware,
+        PrimaryPackagePurpose::Source => Classification::File,
+        PrimaryPackagePurpose::Archive => Classification::File,
+        PrimaryPackagePurpose::File => Classification::File,
+        PrimaryPackagePurpose::Install => Classification::Application,
+        PrimaryPackagePurpose::Other => Classification::Application,
+    }
+}
+
+fn safe_filename(input: &str) -> String {
+    let sanitized: String = input
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '_',
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "sbom".to_string()
+    } else {
+        sanitized
+    }
 }
 
 #[derive(PartialEq, Properties)]
